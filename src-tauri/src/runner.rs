@@ -809,20 +809,25 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires FFMPEG_PATH and FFPROBE_PATH pointing to installed engines"]
     async fn muxing_errors_fail_without_publishing_even_when_logs_are_quiet() {
+        async fn finish_stage<T>(stage: &str, operation: impl std::future::Future<Output = T>) -> T {
+            tokio::time::timeout(Duration::from_secs(30), operation).await
+                .unwrap_or_else(|_| panic!("muxing-error regression stage '{stage}' exceeded 30 seconds"))
+        }
+
         let executable = PathBuf::from(std::env::var("FFMPEG_PATH").expect("set FFMPEG_PATH"));
         let probe = PathBuf::from(std::env::var("FFPROBE_PATH").expect("set FFPROBE_PATH"));
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.mp4");
         let input = directory.path().join("delayed-audio.mkv");
-        let generated = engine::command(&executable).args([
+        let generated = finish_stage("generate audio/video fixture", engine::command(&executable).args([
             "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30",
             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100", "-t", "1.2",
             "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", "-c:a", "aac",
-        ]).arg(&source).output().await.unwrap();
+        ]).arg(&source).output()).await.unwrap();
         assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
-        let delayed = engine::command(&executable).args(["-v", "error", "-i"]).arg(&source)
+        let delayed = finish_stage("delay fixture audio", engine::command(&executable).args(["-v", "error", "-i"]).arg(&source)
             .args(["-itsoffset", "1", "-i"]).arg(&source)
-            .args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy"]).arg(&input).output().await.unwrap();
+            .args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy"]).arg(&input).output()).await.unwrap();
         assert!(delayed.status.success(), "{}", String::from_utf8_lossy(&delayed.stderr));
         fs::remove_file(&source).unwrap();
 
@@ -843,15 +848,17 @@ mod tests {
         let failing_request = request("failed.mp4", "1", false);
         let mut plan = make_plan(&failing_request).unwrap();
         inject_test_threshold(&mut plan);
-        let baseline_args = plan.args.iter().filter(|token| token.as_str() != "-xerror").collect::<Vec<_>>();
-        let baseline = engine::command(&executable).args(baseline_args).output().await.unwrap();
-        assert!(String::from_utf8_lossy(&baseline.stderr).contains("Too many packets buffered"), "{}", String::from_utf8_lossy(&baseline.stderr));
         // FFmpeg 6 is the affected development engine; newer builds may already
-        // return a failure without -xerror, which also satisfies output safety.
-        if engine::verify(&executable).await.unwrap().starts_with("ffmpeg version 6.") {
+        // return a failure or stall in this unprotected historical reproduction.
+        // Every version must still pass the production -xerror checks below.
+        let version = finish_stage("read engine version", engine::verify(&executable)).await.unwrap();
+        if version.starts_with("ffmpeg version 6.") {
+            let baseline_args = plan.args.iter().filter(|token| token.as_str() != "-xerror").collect::<Vec<_>>();
+            let baseline = finish_stage("reproduce FFmpeg 6 exit-zero muxing error", engine::command(&executable).args(baseline_args).output()).await.unwrap();
+            assert!(String::from_utf8_lossy(&baseline.stderr).contains("Too many packets buffered"), "{}", String::from_utf8_lossy(&baseline.stderr));
             assert!(baseline.status.success(), "FFmpeg 6 should reproduce its exit-0 muxing-error behavior");
         }
-        let result = engine::command(&executable).args(&plan.args).output().await.unwrap();
+        let result = finish_stage("reject muxing error with production fail-on-error policy", engine::command(&executable).args(&plan.args).output()).await.unwrap();
         assert!(!result.status.success());
         assert!(String::from_utf8_lossy(&result.stderr).contains("Too many packets buffered"));
         assert_eq!(finalize_output(plan, false, Ok(result.status)).0, "failed");
@@ -859,7 +866,7 @@ mod tests {
 
         let mut quiet_plan = make_plan(&request("quiet-failed.mp4", "1", true)).unwrap();
         inject_test_threshold(&mut quiet_plan);
-        let result = engine::command(&executable).args(&quiet_plan.args).output().await.unwrap();
+        let result = finish_stage("reject muxing error with quiet logs", engine::command(&executable).args(&quiet_plan.args).output()).await.unwrap();
         assert!(!result.status.success());
         assert!(result.stderr.is_empty(), "quiet logs should not be needed to detect a failure");
         assert_eq!(finalize_output(quiet_plan, false, Ok(result.status)).0, "failed");
@@ -867,10 +874,10 @@ mod tests {
 
         let mut recovered = make_plan(&request("recovered.mp4", "1024", false)).unwrap();
         inject_test_threshold(&mut recovered);
-        let result = engine::command(&executable).args(&recovered.args).output().await.unwrap();
+        let result = finish_stage("recover with a sufficient muxing queue", engine::command(&executable).args(&recovered.args).output()).await.unwrap();
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
         assert_eq!(finalize_output(recovered, false, Ok(result.status)).0, "succeeded");
-        let metadata = probe_json(&probe, &directory.path().join("recovered.mp4")).await;
+        let metadata = finish_stage("probe recovered output", probe_json(&probe, &directory.path().join("recovered.mp4"))).await;
         assert_eq!(metadata["streams"][0]["nb_frames"], "36");
         assert_eq!(metadata["streams"][1]["codec_type"], "audio");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2, "temporary or failed outputs must be cleaned up");
