@@ -96,10 +96,10 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 2
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib runner::tests::corrupted_media_fails_with_quiet_logs_and_recovers_safely -- --ignored --exact
-      - name: Test Windows output failure handling
+      - name: Test Windows cancellation after an engine muxing error
         if: runner.os == 'Windows'
         timeout-minutes: 2
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib runner::tests::muxing_errors_fail_without_publishing_even_when_logs_are_quiet -- --ignored --exact
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib runner::tests::windows_muxing_failure_remains_cancelable_without_publishing -- --ignored --exact --nocapture
       - name: Test Windows unknown-duration processing
         if: runner.os == 'Windows'
         timeout-minutes: 2

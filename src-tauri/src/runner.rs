@@ -806,8 +806,9 @@ mod tests {
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "requires FFMPEG_PATH and FFPROBE_PATH pointing to installed engines"]
+    #[ignore = "Unix FFmpeg 6.0 historical regression; requires FFMPEG_PATH and FFPROBE_PATH"]
     async fn muxing_errors_fail_without_publishing_even_when_logs_are_quiet() {
         fn report_child_timeout(stage: &str) {
             match stage {
@@ -901,6 +902,8 @@ mod tests {
 
         let executable = PathBuf::from(std::env::var("FFMPEG_PATH").expect("set FFMPEG_PATH"));
         let probe = PathBuf::from(std::env::var("FFPROBE_PATH").expect("set FFPROBE_PATH"));
+        let version = finish_stage("read engine version", engine::verify(&executable)).await.unwrap();
+        assert!(version.starts_with("ffmpeg version 6.0"), "this Unix historical regression requires the verified FFmpeg 6.0 engine");
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.mp4");
         let input = directory.path().join("delayed-audio.mkv");
@@ -933,16 +936,12 @@ mod tests {
         let failing_request = request("failed.mp4", "1", false);
         let mut plan = make_plan(&failing_request).unwrap();
         inject_test_threshold(&mut plan);
-        // FFmpeg 6 is the affected development engine; newer builds may already
-        // return a failure or stall in this unprotected historical reproduction.
-        // Every version must still pass the production -xerror checks below.
-        let version = finish_stage("read engine version", engine::verify(&executable)).await.unwrap();
-        if version.starts_with("ffmpeg version 6.") {
-            let baseline_args = plan.args.iter().filter(|token| token.as_str() != "-xerror").collect::<Vec<_>>();
-            let baseline = collect_stage_output("reproduce FFmpeg 6 exit-zero muxing error", engine::command(&executable).args(baseline_args)).await;
-            assert!(String::from_utf8_lossy(&baseline.stderr).contains("Too many packets buffered"), "{}", String::from_utf8_lossy(&baseline.stderr));
-            assert!(baseline.status.success(), "FFmpeg 6 should reproduce its exit-0 muxing-error behavior");
-        }
+        // Preserve the exact historical exit-zero reproduction on its verified
+        // engine. Portable decoding failures have their own regression below.
+        let baseline_args = plan.args.iter().filter(|token| token.as_str() != "-xerror").collect::<Vec<_>>();
+        let baseline = collect_stage_output("reproduce FFmpeg 6 exit-zero muxing error", engine::command(&executable).args(baseline_args)).await;
+        assert!(String::from_utf8_lossy(&baseline.stderr).contains("Too many packets buffered"), "{}", String::from_utf8_lossy(&baseline.stderr));
+        assert!(baseline.status.success(), "FFmpeg 6 should reproduce its exit-0 muxing-error behavior");
         let result = collect_stage_output("reject muxing error with production fail-on-error policy", engine::command(&executable).args(&plan.args)).await;
         assert!(!result.status.success());
         assert!(String::from_utf8_lossy(&result.stderr).contains("Too many packets buffered"));
@@ -1308,6 +1307,187 @@ mod tests {
         assert!(status.success());
         assert_eq!(finalize_output(plan, true, Ok(status)).0, "canceled");
         assert!(!output.exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires FFMPEG_PATH pointing to an installed Windows engine"]
+    async fn windows_muxing_failure_remains_cancelable_without_publishing() {
+        async fn finish_stage<T>(stage: &str, operation: impl std::future::Future<Output = T>) -> T {
+            match tokio::time::timeout(Duration::from_secs(30), operation).await {
+                Ok(result) => result,
+                Err(_) => {
+                    match stage {
+                        "generate fixture" => eprintln!("::error::Windows queue cancellation regression timed out during fixture generation."),
+                        "delay fixture audio" => eprintln!("::error::Windows queue cancellation regression timed out during fixture audio delay."),
+                        "prepare input" => eprintln!("::error::Windows queue cancellation regression timed out during input preparation."),
+                        _ => eprintln!("::error::Windows queue cancellation regression timed out during an unclassified setup stage."),
+                    }
+                    panic!("Windows queue cancellation setup stage '{stage}' exceeded 30 seconds");
+                }
+            }
+        }
+
+        async fn abort_test_child(
+            child: &mut tokio::process::Child,
+            tree: &mut Option<ProcessTree>,
+            stdout: &mut tokio::task::JoinHandle<std::io::Result<u64>>,
+            stderr: &mut tokio::task::JoinHandle<std::io::Result<u64>>,
+        ) {
+            stdout.abort();
+            stderr.abort();
+            drop(tree.take());
+            let _ = child.start_kill();
+            if !matches!(tokio::time::timeout(Duration::from_secs(5), child.wait()).await, Ok(Ok(_))) {
+                eprintln!("::error::Windows queue regression could not reap its own test child during failure cleanup.");
+            }
+        }
+
+        let executable = PathBuf::from(std::env::var("FFMPEG_PATH").expect("set FFMPEG_PATH"));
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.mp4");
+        let input = directory.path().join("delayed-audio.mkv");
+        let generated = finish_stage("generate fixture", engine::command(&executable).args([
+            "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100", "-t", "1.2",
+            "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        ]).arg(&source).output()).await.unwrap();
+        assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+        let delayed = finish_stage("delay fixture audio", engine::command(&executable).args(["-v", "error", "-i"]).arg(&source)
+            .args(["-itsoffset", "1", "-i"]).arg(&source)
+            .args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy"]).arg(&input).output()).await.unwrap();
+        assert!(delayed.status.success(), "{}", String::from_utf8_lossy(&delayed.stderr));
+        fs::remove_file(&source).unwrap();
+        let source_bytes = fs::read(&input).unwrap();
+
+        for quiet in [false, true] {
+            let id = if quiet { "quiet-queue" } else { "normal-queue" };
+            let output = directory.path().join(format!("{id}.mp4"));
+            let mut args = vec!["-i".into(), input.to_str().unwrap().into()];
+            args.extend(["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-c:a", "aac", "-max_muxing_queue_size", "1"].map(String::from));
+            if quiet { args.extend(["-loglevel", "quiet"].map(String::from)); }
+            args.push(output.to_str().unwrap().into());
+            let mut plan = make_plan(&JobRequest { id: id.into(), executable: executable.to_str().unwrap().into(), args }).unwrap();
+            assert_eq!(plan.args.iter().filter(|token| token.as_str() == "-xerror").count(), 1);
+            // This threshold is injected only to reproduce the upstream fault
+            // with a tiny fixture; it remains outside the production whitelist.
+            let output_index = plan.args.len() - 1;
+            plan.args.splice(output_index..output_index, ["-muxing_queue_data_threshold", "0"].map(String::from));
+            let staged = plan.staged.path().to_owned();
+            let canceled = AtomicBool::new(false);
+            let notify = Notify::new();
+            let (mut command, _) = finish_stage("prepare input", prepare_command(&executable, &plan, &canceled, &notify)).await.unwrap();
+            let mut child = command.spawn().unwrap();
+            let pid = child.id().expect("spawned child must have an id");
+            let mut tree = match ProcessTree::attach(pid) {
+                Ok(tree) => Some(tree),
+                Err(error) => {
+                    eprintln!("::error::Windows queue cancellation regression could not attach its process-tree object.");
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                    panic!("test process-tree attachment failed: {error}");
+                }
+            };
+            let mut stdin = child.stdin.take();
+            let mut stdout = child.stdout.take().unwrap();
+            let mut stderr = child.stderr.take().unwrap();
+            let observed_fatal = Arc::new(AtomicBool::new(false));
+            let fatal_flag = observed_fatal.clone();
+            let mut stdout_task = tokio::spawn(async move {
+                let mut sink = tokio::io::sink();
+                tokio::io::copy(&mut stdout, &mut sink).await
+            });
+            let mut stderr_task = tokio::spawn(async move {
+                let mut bytes = [0_u8; 4096];
+                let mut tail = Vec::new();
+                let mut total = 0_u64;
+                loop {
+                    let count = stderr.read(&mut bytes).await?;
+                    if count == 0 { break; }
+                    total += count as u64;
+                    tail.extend_from_slice(&bytes[..count]);
+                    if tail.windows(b"Too many packets buffered".len()).any(|part| part == b"Too many packets buffered") {
+                        fatal_flag.store(true, Ordering::SeqCst);
+                    }
+                    // Drain every byte, but retain only enough for a keyword
+                    // split across reads. No child output becomes an annotation.
+                    if tail.len() > 64 { tail.drain(..tail.len() - 64); }
+                }
+                Ok::<_, std::io::Error>(total)
+            });
+
+            let observed = tokio::time::timeout(Duration::from_secs(15), async {
+                let started = std::time::Instant::now();
+                loop {
+                    if let Some(status) = child.try_wait()? { return Ok::<_, std::io::Error>(Some(status)); }
+                    if quiet && started.elapsed() >= Duration::from_secs(1) { return Ok(None); }
+                    if !quiet && observed_fatal.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        return child.try_wait();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await;
+            let natural_status = match observed {
+                Ok(Ok(status)) => status,
+                _ => {
+                    eprintln!("::error::Windows queue regression could not observe its expected fault or natural exit before the deadline.");
+                    abort_test_child(&mut child, &mut tree, &mut stdout_task, &mut stderr_task).await;
+                    panic!("queue fault observation failed");
+                }
+            };
+            // Resolve a natural exit racing with the final observation before
+            // accepting cancellation for a child most recently observed alive.
+            let natural_status = natural_status.or_else(|| child.try_wait().unwrap());
+            let was_canceled = natural_status.is_none();
+            let status = if let Some(status) = natural_status {
+                status
+            } else {
+                if !quiet { assert!(observed_fatal.load(Ordering::SeqCst)); }
+                canceled.store(true, Ordering::SeqCst);
+                let cancel_started = std::time::Instant::now();
+                let status = match tokio::time::timeout(Duration::from_secs(8), graceful_stop(&mut child, &mut stdin, Some(pid))).await {
+                    Ok(Ok(status)) => status,
+                    _ => {
+                        eprintln!("::error::Windows queue cancellation did not reap the child within eight seconds.");
+                        abort_test_child(&mut child, &mut tree, &mut stdout_task, &mut stderr_task).await;
+                        panic!("queue cancellation exceeded its exit deadline");
+                    }
+                };
+                assert!(cancel_started.elapsed() <= Duration::from_secs(8));
+                assert_eq!(child.try_wait().unwrap(), Some(status));
+                status
+            };
+            drop(stdin);
+            // Match production: reap the encoder before closing the job object,
+            // then bound pipe drains independently of process termination.
+            drop(tree.take());
+            let stderr_bytes = match tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(&mut stdout_task, &mut stderr_task)
+            }).await {
+                Ok((stdout, stderr)) => { stdout.unwrap().unwrap(); stderr.unwrap().unwrap() }
+                Err(_) => {
+                    eprintln!("::error::Windows queue regression output pipes remained open after process-tree cleanup.");
+                    abort_test_child(&mut child, &mut tree, &mut stdout_task, &mut stderr_task).await;
+                    panic!("queue regression output drain exceeded its deadline");
+                }
+            };
+            if quiet { assert_eq!(stderr_bytes, 0, "quiet reproduction must not claim a fatal log was observed"); }
+            else { assert!(observed_fatal.load(Ordering::SeqCst), "normal reproduction must reach the actual queue fault"); }
+            if !was_canceled { assert!(!status.success(), "a natural exit must be a real nonzero failure"); }
+            assert_eq!(child.try_wait().unwrap(), Some(status));
+            let expected_state = if was_canceled { "canceled" } else { "failed" };
+            assert_eq!(finalize_output(plan, canceled.load(Ordering::SeqCst), Ok(status)).0, expected_state);
+            assert!(!output.exists() && !staged.exists(), "faulted or canceled output must remain unpublished and be removed");
+            match (quiet, was_canceled) {
+                (false, true) => eprintln!("::notice::Windows queue fatal was observed while the child remained alive; cancellation reaped it and removed unpublished output."),
+                (true, true) => eprintln!("::notice::Windows quiet queue reproduction remained alive and cancellation reaped it without publishing output; no fatal log was observed."),
+                (false, false) => eprintln!("::notice::Windows queue reproduction exited naturally with nonzero status and left no output; this run did not exercise hung-child cancellation."),
+                (true, false) => eprintln!("::notice::Windows quiet queue reproduction exited naturally with nonzero status and left no output; this run did not exercise hung-child cancellation."),
+            }
+        }
+        assert_eq!(fs::read(&input).unwrap(), source_bytes);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1, "unexpected final or staged outputs remain");
     }
 
     #[tokio::test]
