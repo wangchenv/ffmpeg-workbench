@@ -810,8 +810,25 @@ mod tests {
     #[ignore = "requires FFMPEG_PATH and FFPROBE_PATH pointing to installed engines"]
     async fn muxing_errors_fail_without_publishing_even_when_logs_are_quiet() {
         async fn finish_stage<T>(stage: &str, operation: impl std::future::Future<Output = T>) -> T {
-            tokio::time::timeout(Duration::from_secs(30), operation).await
-                .unwrap_or_else(|_| panic!("muxing-error regression stage '{stage}' exceeded 30 seconds"))
+            match tokio::time::timeout(Duration::from_secs(30), operation).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // Emit only fixed check categories to CI annotations.
+                    // Raw child output, paths and environment stay out of them.
+                    match stage {
+                        "generate audio/video fixture" => eprintln!("::error::Media regression timed out during fixture generation."),
+                        "delay fixture audio" => eprintln!("::error::Media regression timed out during fixture audio delay."),
+                        "read engine version" => eprintln!("::error::Media regression timed out during engine version detection."),
+                        "reproduce FFmpeg 6 exit-zero muxing error" => eprintln!("::error::Media regression timed out during historical baseline reproduction."),
+                        "reject muxing error with production fail-on-error policy" => eprintln!("::error::Media regression timed out during production failure handling."),
+                        "reject muxing error with quiet logs" => eprintln!("::error::Media regression timed out during quiet failure handling."),
+                        "recover with a sufficient muxing queue" => eprintln!("::error::Media regression timed out during muxing queue recovery."),
+                        "probe recovered output" => eprintln!("::error::Media regression timed out during recovered output inspection."),
+                        _ => eprintln!("::error::Media regression timed out during an unclassified test stage."),
+                    }
+                    panic!("muxing-error regression stage '{stage}' exceeded 30 seconds")
+                }
+            }
         }
 
         let executable = PathBuf::from(std::env::var("FFMPEG_PATH").expect("set FFMPEG_PATH"));
