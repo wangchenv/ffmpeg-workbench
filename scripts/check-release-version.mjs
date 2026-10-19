@@ -1,7 +1,7 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 
-const read = path => readFileSync(new URL('../' + path, import.meta.url), 'utf8');
+const read = path => readFileSync(new URL('../' + path, import.meta.url), 'utf8').replaceAll('\r\n', '\n');
 const version = JSON.parse(read('package.json')).version;
 assert.match(version, /^\d+\.\d+\.\d+$/);
 const lock = JSON.parse(read('package-lock.json'));
