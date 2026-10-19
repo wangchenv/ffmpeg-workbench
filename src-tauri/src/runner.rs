@@ -885,7 +885,9 @@ mod tests {
         let input = directory.path().join("含 空格 素材.mp4");
         create_av_fixture(&executable, &input).await;
         let metadata = engine::probe_media_path(&executable, input.to_str().unwrap()).await.unwrap();
-        assert_eq!(metadata.probe_source, "ffmpeg");
+        // Installed engines may ship a sibling ffprobe; otherwise the
+        // supported FFmpeg header fallback provides the same business data.
+        assert!(matches!(metadata.probe_source, "ffmpeg" | "ffprobe"), "unexpected metadata provider: {}", metadata.probe_source);
         assert!(metadata.has_video && metadata.has_audio);
         assert_eq!((metadata.width, metadata.height), (Some(160), Some(90)));
         assert_eq!(metadata.frame_rate, Some(12.0));

@@ -60,6 +60,21 @@ jobs:
         run: npm test
       - name: Test native backend
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Install Windows media test engine
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install ffmpeg --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'FFmpeg test dependency installation failed.' }
+          $engine = Get-ChildItem "$env:ChocolateyInstall/lib/ffmpeg/tools" -Recurse -File -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $engine) { throw 'Actual FFmpeg executable not found; a Chocolatey shim is insufficient.' }
+          $probe = Join-Path $engine.DirectoryName ffprobe.exe
+          if (-not (Test-Path -LiteralPath $probe -PathType Leaf)) { throw 'FFprobe test dependency not found.' }
+          "FFMPEG_PATH=$($engine.FullName)" >> $env:GITHUB_ENV
+          "FFPROBE_PATH=$probe" >> $env:GITHUB_ENV
+      - name: Test Windows real media processing and cancellation
+        if: runner.os == 'Windows'
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked -- --include-ignored
       - name: Build installer
         run: npm run desktop:build -- --ci --target ${{ matrix.target }} --bundles ${{ matrix.bundle }} -- --locked
       - name: Collect installer
