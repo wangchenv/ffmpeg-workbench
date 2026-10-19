@@ -1,0 +1,138 @@
+name: Publish verified desktop installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Successful installer build run ID
+        required: true
+        default: '39221164477'
+        type: string
+      release_tag:
+        description: Existing release tag matching the build commit
+        required: true
+        default: v0.2.0
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: publish-verified-installers-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Verify successful source build, existing tag and artifacts
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          metadata_dir=$(mktemp -d)
+          trap 'rm -rf "$metadata_dir"' EXIT
+          gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID" > "$metadata_dir/run.json"
+          gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" > "$metadata_dir/tag.json"
+          tag_ref_sha=$(jq -er '.object.sha | select(test("^[0-9a-f]{40}$"))' "$metadata_dir/tag.json")
+          commit=$tag_ref_sha
+          object_type=$(jq -er '.object.type' "$metadata_dir/tag.json")
+          for depth in 1 2 3 4 5; do
+            if [ "$object_type" = commit ]; then break; fi
+            test "$object_type" = tag
+            gh api "repos/$GH_REPO/git/tags/$commit" > "$metadata_dir/tag-object.json"
+            commit=$(jq -er '.object.sha | select(test("^[0-9a-f]{40}$"))' "$metadata_dir/tag-object.json")
+            object_type=$(jq -er '.object.type' "$metadata_dir/tag-object.json")
+          done
+          test "$object_type" = commit
+          jq -e --arg commit "$commit" --arg repo "$GH_REPO" --arg run "$SOURCE_RUN_ID" '
+            (.id | tostring) == $run and .status == "completed" and .conclusion == "success"
+            and .head_sha == $commit and .repository.full_name == $repo
+            and .head_repository.full_name == $repo and .path == ".github/workflows/release.yml"
+          ' "$metadata_dir/run.json" > /dev/null
+          gh api --paginate --slurp "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID/jobs?filter=latest&per_page=100" > "$metadata_dir/jobs.json"
+          jq -e --arg commit "$commit" '
+            [.[] | .jobs[] | select(.name == "macOS Universal" or .name == "Windows x64")] as $builds
+            | ($builds | map(.name) | sort) == ["Windows x64", "macOS Universal"]
+              and all($builds[]; .status == "completed" and .conclusion == "success" and .head_sha == $commit)
+          ' "$metadata_dir/jobs.json" > /dev/null
+          gh api --paginate --slurp "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" > "$metadata_dir/artifacts.json"
+          jq -e --arg commit "$commit" --arg run "$SOURCE_RUN_ID" '
+            [.[] | .artifacts[]] as $artifacts
+            | ($artifacts | map(.name) | sort) == ["Windows-x64", "macOS-universal"]
+              and all($artifacts[]; .expired == false and .workflow_run.head_sha == $commit
+                and (.workflow_run.id | tostring) == $run and .size_in_bytes > 0)
+          ' "$metadata_dir/artifacts.json" > /dev/null
+          artifact_ids=$(jq -er '[.[] | .artifacts[].id | tostring] | join(",") | select(test("^[0-9]+,[0-9]+$"))' "$metadata_dir/artifacts.json")
+          printf 'commit=%s\ntag_ref_sha=%s\nartifact_ids=%s\n' "$commit" "$tag_ref_sha" "$artifact_ids" >> "$GITHUB_OUTPUT"
+          printf 'Verified the source commit, both platform jobs and both unexpired artifacts.\n'
+
+      - name: Check out the verified release source and notes
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ steps.verify.outputs.commit }}
+          persist-credentials: false
+
+      - name: Download only the two verified build artifacts
+        uses: actions/download-artifact@v8.0.2
+        with:
+          artifact-ids: ${{ steps.verify.outputs.artifact_ids }}
+          path: release-assets
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          digest-mismatch: error
+
+      - name: Verify exact installer set and create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          test -s "docs/releases/${RELEASE_TAG}.md"
+          jq -se --arg version "$version" 'all(.[]; .version == $version)' package.json src-tauri/tauri.conf.json > /dev/null
+          cd release-assets
+          macos="FFmpeg-Workbench_${version}_macOS-universal.dmg"
+          windows="FFmpeg-Workbench_${version}_Windows-x64-setup.exe"
+          test -s "$macos"
+          test -s "$windows"
+          test "$(find . -mindepth 1 | wc -l)" -eq 2
+          test "$(find . -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 2
+          sha256sum "$macos" "$windows" > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+
+      - name: Publish both verified installers as a preview release
+        shell: bash
+        env:
+          VERIFIED_TAG_REF_SHA: ${{ steps.verify.outputs.tag_ref_sha }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.sha)" = "$VERIFIED_TAG_REF_SHA"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease --title "FFmpeg Workbench ${RELEASE_TAG} Preview" --notes-file "docs/releases/${RELEASE_TAG}.md"
+          fi
+          version="${RELEASE_TAG#v}"
+          gh release upload "$RELEASE_TAG" \
+            "release-assets/FFmpeg-Workbench_${version}_macOS-universal.dmg" \
+            "release-assets/FFmpeg-Workbench_${version}_Windows-x64-setup.exe" \
+            release-assets/SHA256SUMS.txt --clobber
+          gh release view "$RELEASE_TAG" --json assets | jq -e --arg version "$version" '
+            (.assets | map(.name) | sort) == ([
+              "FFmpeg-Workbench_" + $version + "_macOS-universal.dmg",
+              "FFmpeg-Workbench_" + $version + "_Windows-x64-setup.exe",
+              "SHA256SUMS.txt"
+            ] | sort)
+          ' > /dev/null
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
