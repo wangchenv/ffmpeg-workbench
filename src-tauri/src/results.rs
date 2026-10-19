@@ -103,7 +103,15 @@ fn reveal_command(platform: &str, path: &Path) -> Result<RevealCommand, String> 
         "macos" => Ok(RevealCommand { program: "/usr/bin/open", args: vec!["-R".into(), path.as_os_str().to_owned()] }),
         "windows" => {
             let mut selection = OsString::from("/select,");
-            selection.push(path);
+            // The runner stores canonical Windows paths (\\?\C:\…). Explorer
+            // expects the ordinary drive spelling for its /select argument.
+            // Only strip a local disk prefix; never turn a UNC/device path
+            // into a different location. The filename stays one OS argument.
+            let shell_path = path.to_str().and_then(|raw| raw.strip_prefix(r"\\?\")).filter(|raw| {
+                let bytes = raw.as_bytes();
+                bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1) == Some(&b':') && bytes.get(2) == Some(&b'\\')
+            }).map(OsString::from).unwrap_or_else(|| path.as_os_str().to_owned());
+            selection.push(shell_path);
             Ok(RevealCommand { program: "explorer.exe", args: vec![selection] })
         }
         "linux" => Ok(RevealCommand { program: "xdg-open", args: vec![path.parent().ok_or("结果路径没有所在文件夹。")?.as_os_str().to_owned()] }),
@@ -208,5 +216,17 @@ mod tests {
         assert_eq!(linux.program, "xdg-open");
         assert_eq!(linux.args, vec![OsString::from("/tmp")]);
         assert!(reveal_command("unsupported", path).is_err());
+    }
+
+    #[test]
+    fn explorer_selection_uses_drive_paths_for_canonical_local_results() {
+        let canonical = Path::new(r"\\?\C:\Users\Test User\含 空格 [a]#;$(literal).mp4");
+        let command = reveal_command("windows", canonical).unwrap();
+        assert_eq!(command.program, "explorer.exe");
+        assert_eq!(command.args, vec![OsString::from(r"/select,C:\Users\Test User\含 空格 [a]#;$(literal).mp4")]);
+        for raw in [r"\\?\UNC\server\share\file.mp4", r"\\?\GLOBALROOT\Device\file.mp4", r"\\.\pipe\file"] {
+            let command = reveal_command("windows", Path::new(raw)).unwrap();
+            assert_eq!(command.args, vec![OsString::from(format!("/select,{raw}"))]);
+        }
     }
 }

@@ -2,7 +2,20 @@
 
 面向日常视频处理的跨平台桌面应用原型，使用 Tauri 2、React、TypeScript 和 Rust。界面将常用 FFmpeg 参数整理为中文功能和可选择的配置，文件在本机处理。
 
-当前原生桌面已在 macOS Apple Silicon 验证；Windows 和 Linux 尚未实机验证。项目仍处于原型阶段，并未覆盖 FFmpeg 的全部参数。
+当前原生桌面已在 macOS Apple Silicon 验证；Windows 和 Intel Mac 尚未完成同等范围的人工界面验收，Linux 尚无安装包。项目仍处于预览阶段，并未覆盖 FFmpeg 的全部参数。
+
+## 下载安装
+
+从 [GitHub Releases](https://github.com/wangchenv/ffmpeg-workbench/releases) 下载当前预览版：
+
+| 平台 | 安装包 | 安装方式 |
+| --- | --- | --- |
+| macOS 11 及以上，Apple Silicon / Intel | `macOS-universal.dmg` | 打开镜像，将应用拖入“应用程序” |
+| Windows 10 / 11，64 位 | `Windows-x64-setup.exe` | 按向导为当前用户安装 |
+
+安装包不附带 FFmpeg，首次使用需在“处理引擎设置”选择本机引擎。Windows 缺少 WebView2 时，安装器需要联网下载该运行时。
+
+当前预览包尚无正式发行签名：macOS 为临时签名且未公证，Windows 未签名；系统可能提示开发者或发行者无法验证。每次发布提供 `SHA256SUMS.txt` 供校验下载内容。
 
 ## 当前功能
 
@@ -58,10 +71,14 @@ npm run dev
 
 ```sh
 npm run build
-npm run desktop:build -- --debug --bundles app
+# 在 macOS 构建通用 DMG，需先安装两个 Rust target
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+npm run desktop:build -- --ci --target universal-apple-darwin --bundles dmg -- --locked
+# 在 Windows 构建 x64 安装程序
+npm run desktop:build -- --ci --target x86_64-pc-windows-msvc --bundles nsis -- --locked
 ```
 
-桌面构建结果由 Tauri 写入 `src-tauri/target/`。打包、签名和分发需按目标平台配置；当前 macOS 开发包采用临时签名，未完成正式分发签名与公证。
+桌面构建结果由 Tauri 写入 `src-tauri/target/`。安装包需在对应操作系统构建。GitHub 工作流会对 `main` 执行双平台构建检查；推送与源码版本一致的 `v*` 标签后，在两个平台均通过测试、打包及安装包检查的前提下发布预览 Release，同时上传两个安装包和 SHA-256 校验文件。
 
 ## 测试
 
@@ -104,4 +121,4 @@ node --import tsx scripts/test-feature-matrix.ts
 
 本仓库不附带 FFmpeg。用户需提供自己的可执行文件，并按所用构建的许可处理分发；应用内的缓存复制仅针对用户已有的本机引擎。
 
-仓库暂未附正式 `LICENSE` 文件。`src-tauri/Cargo.toml` 当前的包元数据标记为 `Apache-2.0`，正式发布前仍需确认并统一应用源码的许可；本次源码上传不新增许可授权文件。
+仓库暂未附正式 `LICENSE` 文件。`src-tauri/Cargo.toml` 当前的包元数据标记为 `Apache-2.0`，仍需确认并统一应用源码的许可；本预览版不新增许可授权文件。

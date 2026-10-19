@@ -29,14 +29,24 @@ pub fn local_path(raw: &str) -> Result<PathBuf, String> {
     if raw.is_empty() || raw == "-" || raw.contains('\0') || raw.contains('%') {
         return Err("首版只支持明确的普通本地文件路径，不支持管道或序列模板。".to_owned());
     }
+    let path = PathBuf::from(raw);
     #[cfg(windows)]
-    let protocol_like = raw.contains(':') && !(raw.as_bytes().get(1) == Some(&b':') && raw.as_bytes()[0].is_ascii_alphabetic());
+    let verbatim_disk = matches!(path.components().next(), Some(std::path::Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_)));
+    #[cfg(windows)]
+    let protocol_like = raw.contains(':') && !verbatim_disk && !(raw.as_bytes().get(1) == Some(&b':') && raw.as_bytes()[0].is_ascii_alphabetic());
     #[cfg(not(windows))]
     let protocol_like = raw.contains(':');
-    if protocol_like || raw.starts_with("\\\\") || raw.starts_with("//") {
+    #[cfg(windows)]
+    let shared_or_device = raw.starts_with("\\\\") && !verbatim_disk;
+    #[cfg(not(windows))]
+    let shared_or_device = raw.starts_with("\\\\");
+    // Windows canonicalize returns \\?\C:\… even for an ordinary local file.
+    // Preserve those disk paths for the runner's second metadata check, while
+    // continuing to reject UNC shares, named pipes and device namespaces.
+    if protocol_like || shared_or_device || raw.starts_with("//") {
         return Err("首版暂不执行网络地址、协议 URL 或共享目录输出。".to_owned());
     }
-    Ok(PathBuf::from(raw))
+    Ok(path)
 }
 
 fn media_path(raw: &str) -> Result<PathBuf, String> {
@@ -483,5 +493,20 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         assert!(media_path(directory.path().to_str().unwrap()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_windows_local_files_remain_valid_but_shared_and_device_paths_do_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("含 空格.mp4");
+        fs::write(&source, b"metadata path regression fixture").unwrap();
+        let canonical = source.canonicalize().unwrap();
+        assert!(matches!(canonical.components().next(), Some(std::path::Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))));
+        assert_eq!(local_path(canonical.to_str().unwrap()).unwrap(), canonical);
+        assert_eq!(media_path(canonical.to_str().unwrap()).unwrap(), canonical);
+        for raw in [r"\\server\share\media.mp4", r"\\?\UNC\server\share\media.mp4", r"\\.\pipe\media", r"\\?\GLOBALROOT\Device\HarddiskVolume1\media.mp4", "//server/share/media.mp4"] {
+            assert!(local_path(raw).is_err(), "{raw}");
+        }
     }
 }
