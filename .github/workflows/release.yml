@@ -92,6 +92,10 @@ jobs:
         if: runner.os == 'Windows'
         timeout-minutes: 2
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib runner::tests::friendly_audio_extraction_supports_formats_and_changes_loudness -- --ignored --exact
+      - name: Test Windows damaged media failure and recovery
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib runner::tests::corrupted_media_fails_with_quiet_logs_and_recovers_safely -- --ignored --exact
       - name: Test Windows output failure handling
         if: runner.os == 'Windows'
         timeout-minutes: 2

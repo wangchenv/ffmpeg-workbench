@@ -185,6 +185,14 @@ pub fn command(path: &Path) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Diagnostics::Debug::{GetErrorMode, SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX};
+        static BACKGROUND_ERROR_MODE: std::sync::Once = std::sync::Once::new();
+        BACKGROUND_ERROR_MODE.call_once(|| unsafe {
+            // Keep existing process flags and prevent child fault dialogs from
+            // silently blocking background FFmpeg. Children inherit this local
+            // process mode; no system-wide error-reporting settings are changed.
+            let _ = SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+        });
         command.as_std_mut().creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     command

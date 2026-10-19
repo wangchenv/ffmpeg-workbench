@@ -1310,6 +1310,121 @@ mod tests {
         assert!(!output.exists());
     }
 
+    #[tokio::test]
+    #[ignore = "requires FFMPEG_PATH and FFPROBE_PATH pointing to installed engines"]
+    async fn corrupted_media_fails_with_quiet_logs_and_recovers_safely() {
+        async fn finish_stage<T>(stage: &str, operation: impl std::future::Future<Output = T>) -> T {
+            match tokio::time::timeout(Duration::from_secs(30), operation).await {
+                Ok(result) => result,
+                Err(_) => {
+                    match stage {
+                        "generate fixture" => eprintln!("::error::Corrupted-media regression timed out during fixture generation."),
+                        "locate video packet" => eprintln!("::error::Corrupted-media regression timed out during packet inspection."),
+                        "inspect damaged metadata" => eprintln!("::error::Corrupted-media regression timed out during damaged metadata inspection."),
+                        "prepare damaged input" => eprintln!("::error::Corrupted-media regression timed out during damaged input preparation."),
+                        "encode damaged input" => eprintln!("::error::Corrupted-media regression timed out during normal failure handling."),
+                        "encode damaged input quietly" => eprintln!("::error::Corrupted-media regression timed out during quiet failure handling."),
+                        "prepare recovery" => eprintln!("::error::Corrupted-media regression timed out during recovery preparation."),
+                        "encode recovery" => eprintln!("::error::Corrupted-media regression timed out during recovery encoding."),
+                        "inspect recovery" => eprintln!("::error::Corrupted-media regression timed out during recovered output inspection."),
+                        _ => eprintln!("::error::Corrupted-media regression timed out during an unclassified test stage."),
+                    }
+                    panic!("corrupted-media regression stage '{stage}' exceeded 30 seconds");
+                }
+            }
+        }
+
+        let executable = PathBuf::from(std::env::var("FFMPEG_PATH").expect("set FFMPEG_PATH"));
+        let probe = PathBuf::from(std::env::var("FFPROBE_PATH").expect("set FFPROBE_PATH"));
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("original-faststart.mp4");
+        let damaged = directory.path().join("damaged-faststart.mp4");
+        let generated = finish_stage("generate fixture", engine::command(&executable).args([
+            "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12", "-t", "3",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart",
+        ]).arg(&source).output()).await.unwrap();
+        assert!(generated.status.success(), "{}", String::from_utf8_lossy(&generated.stderr));
+        let original_bytes = fs::read(&source).unwrap();
+        let packets = finish_stage("locate video packet", engine::command(&probe).args([
+            "-v", "error", "-select_streams", "v:0", "-show_packets", "-show_entries", "packet=pos,size", "-of", "json",
+        ]).arg(&source).output()).await.unwrap();
+        assert!(packets.status.success(), "{}", String::from_utf8_lossy(&packets.stderr));
+        let packets: Value = serde_json::from_slice(&packets.stdout).unwrap();
+        let packets = packets["packets"].as_array().unwrap();
+        assert_eq!(packets.len(), 36);
+        let packet = &packets[packets.len() / 2];
+        let position = packet["pos"].as_str().unwrap().parse::<usize>().unwrap();
+        let size = packet["size"].as_str().unwrap().parse::<usize>().unwrap();
+        assert!(size > 4 && position > 0 && position.checked_add(size).is_some_and(|end| end <= original_bytes.len()));
+        let mut damaged_bytes = original_bytes.clone();
+        // MP4 stores the NAL length before the packet payload. Invalidating a
+        // later real packet preserves moov and earlier decodable video, unlike
+        // a missing header rejected before the production encoder ever starts.
+        damaged_bytes[position..position + size].fill(0xff);
+        fs::write(&damaged, &damaged_bytes).unwrap();
+        assert_eq!(damaged_bytes.len(), original_bytes.len());
+        let metadata = finish_stage("inspect damaged metadata", engine::probe_media_path(&executable, damaged.to_str().unwrap())).await.unwrap();
+        assert!(metadata.has_video && !metadata.has_audio);
+        assert_eq!((metadata.width, metadata.height), (Some(160), Some(90)));
+        assert_eq!(metadata.frame_rate, Some(12.0));
+        assert!((metadata.duration_seconds.unwrap() - 3.0).abs() < 0.05);
+
+        let request = |input: &Path, id: &str, quiet: bool| {
+            let output = directory.path().join(format!("{id}.mp4"));
+            let mut args = vec!["-i".into(), input.to_str().unwrap().into(), "-c:v".into(), "mpeg4".into(), "-an".into()];
+            if quiet { args.extend(["-loglevel", "quiet"].map(String::from)); }
+            args.push(output.to_str().unwrap().into());
+            JobRequest { id: id.into(), executable: executable.to_str().unwrap().into(), args }
+        };
+        for (id, quiet) in [("normal-failure", false), ("quiet-failure", true)] {
+            let output = directory.path().join(format!("{id}.mp4"));
+            let plan = make_plan(&request(&damaged, id, quiet)).unwrap();
+            assert_eq!(plan.args.iter().filter(|token| token.as_str() == "-xerror").count(), 1);
+            let staged = plan.staged.path().to_owned();
+            let canceled = AtomicBool::new(false);
+            let notify = Notify::new();
+            let (mut command, duration) = finish_stage("prepare damaged input", prepare_command(&executable, &plan, &canceled, &notify)).await.unwrap();
+            assert!((duration.unwrap().seconds - 3.0).abs() < 0.05);
+            let phase = if quiet { "encode damaged input quietly" } else { "encode damaged input" };
+            let encoded = finish_stage(phase, command.output()).await.unwrap();
+            let partial_bytes = fs::metadata(&staged).map(|metadata| metadata.len()).unwrap_or(0);
+            // Observation only: encoders may buffer differently across builds.
+            // A forced timeout is never considered the expected media failure.
+            println!("corrupted-media {id}: staged partial bytes={partial_bytes}");
+            assert!(!encoded.status.success(), "damaged media unexpectedly encoded successfully");
+            if quiet { assert!(encoded.stderr.is_empty(), "quiet failure must not depend on stderr logs"); }
+            assert_eq!(finalize_output(plan, false, Ok(encoded.status)).0, "failed");
+            assert!(!output.exists(), "damaged media was published");
+            assert!(!staged.exists(), "failed staged output was not removed");
+        }
+
+        // Keep the same encoder and quiet log setting; replacing only the
+        // damaged input with its original must produce a complete real result.
+        let output = directory.path().join("recovered.mp4");
+        let plan = make_plan(&request(&source, "recovered", true)).unwrap();
+        assert_eq!(plan.args.iter().filter(|token| token.as_str() == "-xerror").count(), 1);
+        let staged = plan.staged.path().to_owned();
+        let canceled = AtomicBool::new(false);
+        let notify = Notify::new();
+        let (mut command, duration) = finish_stage("prepare recovery", prepare_command(&executable, &plan, &canceled, &notify)).await.unwrap();
+        assert!((duration.unwrap().seconds - 3.0).abs() < 0.05);
+        let encoded = finish_stage("encode recovery", command.output()).await.unwrap();
+        assert!(encoded.status.success(), "valid source failed with the same production configuration");
+        assert!(encoded.stderr.is_empty());
+        assert_eq!(finalize_output(plan, false, Ok(encoded.status)).0, "succeeded");
+        assert!(!staged.exists());
+        let metadata = finish_stage("inspect recovery", probe_json(&probe, &output)).await;
+        assert_eq!(metadata["streams"].as_array().unwrap().len(), 1);
+        assert_eq!(metadata["streams"][0]["codec_name"], "mpeg4");
+        assert_eq!(metadata["streams"][0]["width"], 160);
+        assert_eq!(metadata["streams"][0]["height"], 90);
+        assert_eq!(metadata["streams"][0]["nb_frames"], "36");
+        assert!((metadata["format"]["duration"].as_str().unwrap().parse::<f64>().unwrap() - 3.0).abs() < 0.05);
+        assert_eq!(fs::read(&source).unwrap(), original_bytes);
+        assert_eq!(fs::read(&damaged).unwrap(), damaged_bytes);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 3, "unexpected failed or staged outputs remain");
+    }
+
     trait ErrorText { fn unwrap_err_text(self) -> String; }
     impl ErrorText for Result<Plan, String> {
         fn unwrap_err_text(self) -> String { match self { Err(error) => error, Ok(_) => panic!("expected error") } }
