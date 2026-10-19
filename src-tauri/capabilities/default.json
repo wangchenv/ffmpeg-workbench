@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "The local workbench can invoke its own constrained Rust commands and receive job events.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
