@@ -809,6 +809,74 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires FFMPEG_PATH and FFPROBE_PATH pointing to installed engines"]
     async fn muxing_errors_fail_without_publishing_even_when_logs_are_quiet() {
+        fn report_child_timeout(stage: &str) {
+            match stage {
+                "reproduce FFmpeg 6 exit-zero muxing error" => eprintln!("::error::Media regression historical baseline child remained running beyond 30 seconds."),
+                "reject muxing error with production fail-on-error policy" => eprintln!("::error::Media regression production failure child remained running beyond 30 seconds."),
+                "reject muxing error with quiet logs" => eprintln!("::error::Media regression quiet failure child remained running beyond 30 seconds."),
+                "recover with a sufficient muxing queue" => eprintln!("::error::Media regression recovery child remained running beyond 30 seconds."),
+                _ => eprintln!("::error::Media regression child remained running beyond 30 seconds."),
+            }
+        }
+
+        fn report_pipe_timeout(stage: &str) {
+            match stage {
+                "reproduce FFmpeg 6 exit-zero muxing error" => eprintln!("::error::Media regression historical baseline child exited but output pipes did not close within 2 seconds."),
+                "reject muxing error with production fail-on-error policy" => eprintln!("::error::Media regression production failure child exited but output pipes did not close within 2 seconds."),
+                "reject muxing error with quiet logs" => eprintln!("::error::Media regression quiet failure child exited but output pipes did not close within 2 seconds."),
+                "recover with a sufficient muxing queue" => eprintln!("::error::Media regression recovery child exited but output pipes did not close within 2 seconds."),
+                _ => eprintln!("::error::Media regression child exited but output pipes did not close within 2 seconds."),
+            }
+        }
+
+        async fn collect_stage_output(stage: &str, command: &mut tokio::process::Command) -> std::process::Output {
+            // Distinguish a live encoder hang from inherited pipe handles. An
+            // output() timeout cannot tell which of those is still pending.
+            // Both remain test failures; killing a child never counts as a
+            // successful reproduction of the encoder's own failure status.
+            let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let mut stderr = child.stderr.take().unwrap();
+            let mut stdout_task = tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+            });
+            let mut stderr_task = tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+            });
+            let status = match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+                Ok(result) => result.unwrap(),
+                Err(_) => match child.try_wait().unwrap() {
+                    // Resolve the narrow race where the child exited exactly
+                    // as the deadline expired before diagnosing its pipes.
+                    Some(status) => status,
+                    None => {
+                        report_child_timeout(stage);
+                        let _ = child.start_kill();
+                        if !matches!(tokio::time::timeout(Duration::from_secs(5), child.wait()).await, Ok(Ok(_))) {
+                            eprintln!("::error::Media regression timed-out test child could not be reaped within 5 seconds.");
+                        }
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        panic!("muxing-error regression stage '{stage}' child remained alive beyond its deadline");
+                    }
+                },
+            };
+            let (stdout, stderr) = match tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(&mut stdout_task, &mut stderr_task)
+            }).await {
+                Ok((stdout, stderr)) => (stdout.unwrap().unwrap(), stderr.unwrap().unwrap()),
+                Err(_) => {
+                    report_pipe_timeout(stage);
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    panic!("muxing-error regression stage '{stage}' exited but its output pipes remained open");
+                }
+            };
+            std::process::Output { status, stdout, stderr }
+        }
+
         async fn finish_stage<T>(stage: &str, operation: impl std::future::Future<Output = T>) -> T {
             match tokio::time::timeout(Duration::from_secs(30), operation).await {
                 Ok(result) => result,
@@ -871,11 +939,11 @@ mod tests {
         let version = finish_stage("read engine version", engine::verify(&executable)).await.unwrap();
         if version.starts_with("ffmpeg version 6.") {
             let baseline_args = plan.args.iter().filter(|token| token.as_str() != "-xerror").collect::<Vec<_>>();
-            let baseline = finish_stage("reproduce FFmpeg 6 exit-zero muxing error", engine::command(&executable).args(baseline_args).output()).await.unwrap();
+            let baseline = collect_stage_output("reproduce FFmpeg 6 exit-zero muxing error", engine::command(&executable).args(baseline_args)).await;
             assert!(String::from_utf8_lossy(&baseline.stderr).contains("Too many packets buffered"), "{}", String::from_utf8_lossy(&baseline.stderr));
             assert!(baseline.status.success(), "FFmpeg 6 should reproduce its exit-0 muxing-error behavior");
         }
-        let result = finish_stage("reject muxing error with production fail-on-error policy", engine::command(&executable).args(&plan.args).output()).await.unwrap();
+        let result = collect_stage_output("reject muxing error with production fail-on-error policy", engine::command(&executable).args(&plan.args)).await;
         assert!(!result.status.success());
         assert!(String::from_utf8_lossy(&result.stderr).contains("Too many packets buffered"));
         assert_eq!(finalize_output(plan, false, Ok(result.status)).0, "failed");
@@ -883,7 +951,7 @@ mod tests {
 
         let mut quiet_plan = make_plan(&request("quiet-failed.mp4", "1", true)).unwrap();
         inject_test_threshold(&mut quiet_plan);
-        let result = finish_stage("reject muxing error with quiet logs", engine::command(&executable).args(&quiet_plan.args).output()).await.unwrap();
+        let result = collect_stage_output("reject muxing error with quiet logs", engine::command(&executable).args(&quiet_plan.args)).await;
         assert!(!result.status.success());
         assert!(result.stderr.is_empty(), "quiet logs should not be needed to detect a failure");
         assert_eq!(finalize_output(quiet_plan, false, Ok(result.status)).0, "failed");
@@ -891,7 +959,7 @@ mod tests {
 
         let mut recovered = make_plan(&request("recovered.mp4", "1024", false)).unwrap();
         inject_test_threshold(&mut recovered);
-        let result = finish_stage("recover with a sufficient muxing queue", engine::command(&executable).args(&recovered.args).output()).await.unwrap();
+        let result = collect_stage_output("recover with a sufficient muxing queue", engine::command(&executable).args(&recovered.args)).await;
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
         assert_eq!(finalize_output(recovered, false, Ok(result.status)).0, "succeeded");
         let metadata = finish_stage("probe recovered output", probe_json(&probe, &directory.path().join("recovered.mp4"))).await;
